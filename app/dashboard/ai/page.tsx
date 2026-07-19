@@ -59,10 +59,14 @@ export default function AIInterviewPage() {
   const [reportTab, setReportTab] = useState<"overview" | "questions" | "skills" | "transcript" | "proctor">("overview");
   const [expandedQuestion, setExpandedQuestion] = useState<string | null>(null);
 
-  // Refs for Video Elements & Web Speech API
+  // Refs for Video Elements, Web Speech API & Deepgram
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const lobbyVideoRef = useRef<HTMLVideoElement>(null);
   const speechRecognitionRef = useRef<any>(null);
+  const deepgramSocketRef = useRef<WebSocket | null>(null);
+  const deepgramRecorderRef = useRef<MediaRecorder | null>(null);
+  const finalizedTranscriptRef = useRef<string>("");
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
   const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const screenGraceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const screenGraceCountdownRef = useRef<number>(30);
@@ -145,6 +149,67 @@ export default function AIInterviewPage() {
     setCameraStream(null);
     setMicStream(null);
     setScreenStream(null);
+
+    // Stop Deepgram & TTS
+    if (deepgramSocketRef.current) {
+      try {
+        deepgramSocketRef.current.onclose = null;
+        deepgramSocketRef.current.close();
+      } catch (e) {}
+      deepgramSocketRef.current = null;
+    }
+    if (deepgramRecorderRef.current) {
+      try {
+        deepgramRecorderRef.current.stop();
+      } catch (e) {}
+      deepgramRecorderRef.current = null;
+    }
+    if (ttsAudioRef.current) {
+      ttsAudioRef.current.pause();
+      ttsAudioRef.current = null;
+    }
+  };
+
+  const handleExit = () => {
+    const activeViews = ["permissions", "lobby", "in_progress"];
+    if (activeViews.includes(view)) {
+      const confirmExit = window.confirm(
+        "Are you sure you want to exit the interview? Your progress in this round will be saved."
+      );
+      if (!confirmExit) return;
+    }
+
+    try {
+      if (recorder) recorder.stop();
+    } catch (e) {}
+    try {
+      if (speechRecognitionRef.current) {
+        speechRecognitionRef.current.stop();
+      }
+    } catch (e) {}
+
+    try {
+      if (cameraStream) cameraStream.getTracks().forEach(t => t.stop());
+      if (micStream) micStream.getTracks().forEach(t => t.stop());
+      if (screenStream) screenStream.getTracks().forEach(t => t.stop());
+    } catch (e) {}
+    stopStreams();
+
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(err => {
+        console.error("Error exiting fullscreen:", err);
+      });
+    }
+
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      const fId = params.get("fullSessionId");
+      if (fId) {
+        window.location.href = `/dashboard/interview?sessionId=${fId}`;
+        return;
+      }
+    }
+    window.location.href = "/dashboard";
   };
 
   // Recover active session
@@ -372,18 +437,120 @@ export default function AIInterviewPage() {
     }
   };
 
+  // Start Deepgram WebSocket Recognition
+  const startDeepgramRecognition = async (): Promise<boolean> => {
+    try {
+      const tokenRes = await fetch("/api/deepgram/token");
+      if (tokenRes.ok) {
+        const { token } = await tokenRes.json();
+        const ws = new WebSocket("wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true", ["token", token]);
+        deepgramSocketRef.current = ws;
+
+        ws.onopen = async () => {
+          try {
+            const stream = micStream || await navigator.mediaDevices.getUserMedia({ audio: true });
+            const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+            deepgramRecorderRef.current = recorder;
+            recorder.ondataavailable = (e) => {
+              if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+                ws.send(e.data);
+              }
+            };
+            recorder.start(250);
+          } catch (err) {
+            console.error("Deepgram MediaRecorder start error:", err);
+          }
+        };
+
+        ws.onmessage = (event) => {
+          const data = JSON.parse(event.data);
+          const transcript = data.channel?.alternatives?.[0]?.transcript;
+          if (!transcript) return;
+
+          if (data.is_final) {
+            finalizedTranscriptRef.current = (finalizedTranscriptRef.current + " " + transcript).trim();
+            setLiveTranscript(finalizedTranscriptRef.current);
+          } else {
+            setLiveTranscript((finalizedTranscriptRef.current + " " + transcript).trim());
+          }
+        };
+
+        ws.onerror = (err) => {
+          console.error("Deepgram WebSocket error:", err);
+        };
+
+        ws.onclose = () => {
+          console.log("Deepgram WebSocket closed");
+        };
+        return true;
+      }
+    } catch (err) {
+      console.warn("Deepgram token fetch failed, falling back to Web Speech:", err);
+    }
+    return false;
+  };
+
+  const stopDeepgramRecognition = () => {
+    if (deepgramSocketRef.current) {
+      try {
+        deepgramSocketRef.current.onclose = null;
+        deepgramSocketRef.current.close();
+      } catch (e) {}
+      deepgramSocketRef.current = null;
+    }
+    if (deepgramRecorderRef.current) {
+      try {
+        deepgramRecorderRef.current.stop();
+      } catch (e) {}
+      deepgramRecorderRef.current = null;
+    }
+  };
+
   // Web Speech synthesis
-  const triggerAIVoice = (text: string) => {
+  const triggerAIVoice = async (text: string) => {
     setAvatarState("speaking");
     setIsListening(false);
-    if (speechRecognitionRef.current) {
-      try { speechRecognitionRef.current.stop(); } catch (e) { }
+    
+    stopListening();
+
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+    if (ttsAudioRef.current) {
+      ttsAudioRef.current.pause();
+      ttsAudioRef.current = null;
     }
 
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
+    try {
+      const res = await fetch("/api/deepgram/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, voice: "aura-asteria-en" })
+      });
+      if (res.ok) {
+        const blob = await res.blob();
+        const audioUrl = URL.createObjectURL(blob);
+        const audio = new Audio(audioUrl);
+        ttsAudioRef.current = audio;
+        
+        audio.onended = () => {
+          setAvatarState("listening");
+          startListening();
+        };
+        audio.onerror = () => {
+          setAvatarState("listening");
+          startListening();
+        };
+        
+        await audio.play();
+        return;
+      }
+    } catch (err) {
+      console.warn("Deepgram TTS failed, falling back to Web Speech:", err);
+    }
 
-    // Choose nice female/male voice if available
+    // Fallback to Browser Web Speech API
+    const utterance = new SpeechSynthesisUtterance(text);
     const voices = window.speechSynthesis.getVoices();
     const cleanVoice = voices.find(v => v.lang.startsWith("en") && (v.name.includes("Google") || v.name.includes("Natural")));
     if (cleanVoice) utterance.voice = cleanVoice;
@@ -392,7 +559,6 @@ export default function AIInterviewPage() {
       setAvatarState("listening");
       startListening();
     };
-
     utterance.onerror = () => {
       setAvatarState("listening");
       startListening();
@@ -437,18 +603,29 @@ export default function AIInterviewPage() {
 
   const startListening = () => {
     setIsListening(true);
+    finalizedTranscriptRef.current = "";
     setLiveTranscript("");
-    if (speechRecognitionRef.current) {
-      try {
-        speechRecognitionRef.current.start();
-      } catch (err) {
-        console.error(err);
+    
+    // First try Deepgram
+    startDeepgramRecognition().then(success => {
+      if (success) return;
+      
+      // Fallback to Web Speech API
+      if (speechRecognitionRef.current) {
+        try {
+          speechRecognitionRef.current.start();
+        } catch (err) {
+          console.error(err);
+        }
       }
-    }
+    });
   };
 
   const stopListening = () => {
     setIsListening(false);
+    
+    stopDeepgramRecognition();
+
     if (speechRecognitionRef.current) {
       try {
         speechRecognitionRef.current.stop();
@@ -464,6 +641,7 @@ export default function AIInterviewPage() {
     setAvatarState("thinking");
 
     const finalAnswer = liveTranscript.trim() || "(No verbal answer provided)";
+    finalizedTranscriptRef.current = "";
     setLiveTranscript("");
 
     try {
@@ -835,15 +1013,23 @@ export default function AIInterviewPage() {
               Conduct an automated, proctored mock interview driven by dynamic Gemini AI feedback.
             </p>
           </div>
-          {view !== "config" && (
+          <div className="flex items-center gap-2">
             <button
-              onClick={handleResetAll}
-              className="flex items-center gap-1.5 text-xs text-[#2563EB] bg-blue-50 hover:bg-blue-100/80 px-3 py-2 rounded-lg font-medium transition"
+              onClick={handleExit}
+              className="flex items-center gap-1.5 text-xs text-slate-700 font-semibold border border-slate-200 bg-white hover:bg-slate-50 px-4 py-2 rounded-xl transition shadow-sm"
             >
-              <RefreshCw className="w-3.5 h-3.5" />
-              {typeof window !== "undefined" && new URLSearchParams(window.location.search).get("fullSessionId") ? "Return to Full Interview" : "Configure New Interview"}
+              <LogOut className="w-3.5 h-3.5 text-slate-500" /> Exit
             </button>
-          )}
+            {view !== "config" && (
+              <button
+                onClick={handleResetAll}
+                className="flex items-center gap-1.5 text-xs text-[#2563EB] bg-blue-50 hover:bg-blue-100/80 px-3 py-2 rounded-lg font-medium transition"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                {typeof window !== "undefined" && new URLSearchParams(window.location.search).get("fullSessionId") ? "Return to Full Interview" : "Configure New Interview"}
+              </button>
+            )}
+          </div>
         </div>
       )}
 
@@ -1089,61 +1275,70 @@ export default function AIInterviewPage() {
 
       {/* VIEW: LOBBY COUNTDOWN */}
       {view === "lobby" && (
-        <div className="max-w-4xl mx-auto grid grid-cols-1 md:grid-cols-2 gap-8 items-center pt-8">
-
-          {/* Lobby Preview Feed */}
-          <div className="relative aspect-video bg-slate-950 rounded-2xl overflow-hidden border border-slate-800 shadow-xl flex items-center justify-center">
-            <video
-              ref={lobbyVideoRef}
-              autoPlay
-              playsInline
-              muted
-              className="w-full h-full object-cover scale-x-[-1]"
-            />
-
-            {/* Guide Guidelines Cards */}
-            <div className="absolute inset-0 bg-slate-950/60 backdrop-blur-sm flex flex-col justify-end p-6 text-white">
-              <h3 className="text-base font-bold mb-4 flex items-center gap-2">
-                <Shield className="w-5 h-5 text-blue-400" />
-                Proctoring Guidelines
-              </h3>
-              <ul className="space-y-2 text-xs text-slate-200">
-                <li className="flex gap-2 items-center">
-                  <span className="w-1.5 h-1.5 bg-blue-400 rounded-full"></span>
-                  Ensure you are in a quiet, well-lit environment.
-                </li>
-                <li className="flex gap-2 items-center">
-                  <span className="w-1.5 h-1.5 bg-blue-400 rounded-full"></span>
-                  Keep your face clearly aligned within the camera feed.
-                </li>
-                <li className="flex gap-2 items-center">
-                  <span className="w-1.5 h-1.5 bg-blue-400 rounded-full"></span>
-                  Tab-switching or exiting fullscreen mode is strictly monitored.
-                </li>
-                <li className="flex gap-2 items-center">
-                  <span className="w-1.5 h-1.5 bg-blue-400 rounded-full"></span>
-                  Ensure screen sharing remains active for your entire display.
-                </li>
-              </ul>
-            </div>
+        <div className="max-w-4xl mx-auto space-y-6 pt-8">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-bold text-slate-800">Interview Room Initializing</h2>
+            <button
+              onClick={handleExit}
+              className="flex items-center gap-1.5 text-xs text-rose-600 bg-rose-50 hover:bg-rose-100 px-3.5 py-1.5 rounded-lg transition font-semibold"
+            >
+              <LogOut className="w-3.5 h-3.5" /> Exit Setup
+            </button>
           </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-8 items-center">
+            {/* Lobby Preview Feed */}
+            <div className="relative aspect-video bg-slate-950 rounded-2xl overflow-hidden border border-slate-800 shadow-xl flex items-center justify-center">
+              <video
+                ref={lobbyVideoRef}
+                autoPlay
+                playsInline
+                muted
+                className="w-full h-full object-cover scale-x-[-1]"
+              />
 
-          {/* Large Countdown */}
-          <div className="bg-white border border-[#E5E7EB] rounded-2xl p-10 shadow-sm text-center flex flex-col items-center justify-center">
-            <span className="text-xs uppercase font-bold tracking-wider text-rose-500 mb-2">AI Interview Starting Soon</span>
-            <h2 className="text-xl font-bold text-[#111111] mb-6">Prepare to engage with the AI Panel</h2>
-
-            {/* Circular Countdown Ring */}
-            <div className="relative w-36 h-36 flex items-center justify-center border-4 border-slate-100 rounded-full mb-6">
-              <div className="absolute inset-0 rounded-full border-4 border-blue-600 border-t-transparent animate-spin"></div>
-              <span className="text-5xl font-black text-slate-800">{countdown}</span>
+              {/* Guide Guidelines Cards */}
+              <div className="absolute inset-0 bg-slate-950/60 backdrop-blur-sm flex flex-col justify-end p-6 text-white">
+                <h3 className="text-base font-bold mb-4 flex items-center gap-2">
+                  <Shield className="w-5 h-5 text-blue-400" />
+                  Proctoring Guidelines
+                </h3>
+                <ul className="space-y-2 text-xs text-slate-200">
+                  <li className="flex gap-2 items-center">
+                    <span className="w-1.5 h-1.5 bg-blue-400 rounded-full"></span>
+                    Ensure you are in a quiet, well-lit environment.
+                  </li>
+                  <li className="flex gap-2 items-center">
+                    <span className="w-1.5 h-1.5 bg-blue-400 rounded-full"></span>
+                    Keep your face clearly aligned within the camera feed.
+                  </li>
+                  <li className="flex gap-2 items-center">
+                    <span className="w-1.5 h-1.5 bg-blue-400 rounded-full"></span>
+                    Tab-switching or exiting fullscreen mode is strictly monitored.
+                  </li>
+                  <li className="flex gap-2 items-center">
+                    <span className="w-1.5 h-1.5 bg-blue-400 rounded-full"></span>
+                    Ensure screen sharing remains active for your entire display.
+                  </li>
+                </ul>
+              </div>
             </div>
 
-            <p className="text-xs text-[#6B7280] leading-relaxed">
-              We are initializing the interview room. This workspace will lock into fullscreen mode automatically.
-            </p>
-          </div>
+            {/* Large Countdown */}
+            <div className="bg-white border border-[#E5E7EB] rounded-2xl p-10 shadow-sm text-center flex flex-col items-center justify-center">
+              <span className="text-xs uppercase font-bold tracking-wider text-rose-500 mb-2">AI Interview Starting Soon</span>
+              <h2 className="text-xl font-bold text-[#111111] mb-6">Prepare to engage with the AI Panel</h2>
 
+              {/* Circular Countdown Ring */}
+              <div className="relative w-36 h-36 flex items-center justify-center border-4 border-slate-100 rounded-full mb-6">
+                <div className="absolute inset-0 rounded-full border-4 border-blue-600 border-t-transparent animate-spin"></div>
+                <span className="text-5xl font-black text-slate-800">{countdown}</span>
+              </div>
+
+              <p className="text-xs text-[#6B7280] leading-relaxed">
+                We are initializing the interview room. This workspace will lock into fullscreen mode automatically.
+              </p>
+            </div>
+          </div>
         </div>
       )}
 
@@ -1163,9 +1358,17 @@ export default function AIInterviewPage() {
               <span>Question {session?.questions.length || 1} / 10</span>
             </div>
 
-            <div className="flex items-center gap-2 text-slate-400 font-medium text-xs bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800">
-              <Clock className="w-4 h-4 text-rose-500" />
-              <span>{formatTimer(interviewTime)}</span>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={handleExit}
+                className="flex items-center gap-1.5 text-xs text-rose-400 bg-rose-950/40 hover:bg-rose-900/60 px-3.5 py-1.5 rounded-lg border border-rose-900/40 transition font-semibold"
+              >
+                <LogOut className="w-3.5 h-3.5" /> Exit Interview
+              </button>
+              <div className="flex items-center gap-2 text-slate-400 font-medium text-xs bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800">
+                <Clock className="w-4 h-4 text-rose-500" />
+                <span>{formatTimer(interviewTime)}</span>
+              </div>
             </div>
           </div>
 

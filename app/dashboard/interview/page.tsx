@@ -11,6 +11,8 @@ import {
   CheckCircle,
   Clock,
   ArrowRight,
+  ArrowLeft,
+  LogOut,
   TrendingUp,
   Award,
   AlertTriangle,
@@ -117,11 +119,19 @@ export default function FullInterviewPage() {
   if (!sessionId && !context) {
     return (
       <div className="max-w-8xl mx-auto pb-12">
-        <div className="mb-8">
-          <h1 className="text-2xl font-bold text-[#111111] tracking-tight">Setup Full E2E Assessment</h1>
-          <p className="text-[#6B7280] mt-1 text-[13px]">
-            Provide a JD, Resume, or select a role to configure your comprehensive multi-round practice loop.
-          </p>
+        <div className="mb-8 flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-[#111111] tracking-tight">Setup Full E2E Assessment</h1>
+            <p className="text-[#6B7280] mt-1 text-[13px]">
+              Provide a JD, Resume, or select a role to configure your comprehensive multi-round practice loop.
+            </p>
+          </div>
+          <button
+            onClick={() => window.location.href = "/dashboard"}
+            className="flex items-center gap-1.5 text-xs text-slate-700 font-semibold border border-slate-200 bg-white hover:bg-slate-50 px-4 py-2 rounded-xl transition shadow-sm"
+          >
+            <LogOut className="w-3.5 h-3.5 text-slate-500" /> Exit to Dashboard
+          </button>
         </div>
         <InterviewConfiguration
           interviewType="full"
@@ -168,26 +178,34 @@ export default function FullInterviewPage() {
 
           <div className="flex items-center justify-between gap-4">
             <button
-              onClick={handleResetAll}
-              className="text-xs font-semibold text-slate-500 hover:text-slate-700 transition"
+              onClick={() => window.location.href = "/dashboard"}
+              className="text-xs font-semibold text-slate-500 hover:text-slate-700 transition flex items-center gap-1"
             >
-              Reconfigure
+              <ArrowLeft className="w-3.5 h-3.5" /> Exit to Dashboard
             </button>
-            <button
-              onClick={handleStartFullInterview}
-              disabled={starting}
-              className="px-6 py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-semibold text-xs rounded-xl shadow-md transition flex items-center gap-2"
-            >
-              {starting ? (
-                <>
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> Starting...
-                </>
-              ) : (
-                <>
-                  Start E2E Interview <ArrowRight className="w-3.5 h-3.5" />
-                </>
-              )}
-            </button>
+            <div className="flex items-center gap-4">
+              <button
+                onClick={handleResetAll}
+                className="text-xs font-semibold text-slate-500 hover:text-slate-700 transition"
+              >
+                Reconfigure
+              </button>
+              <button
+                onClick={handleStartFullInterview}
+                disabled={starting}
+                className="px-6 py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-semibold text-xs rounded-xl shadow-md transition flex items-center gap-2"
+              >
+                {starting ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" /> Starting...
+                  </>
+                ) : (
+                  <>
+                    Start E2E Interview <ArrowRight className="w-3.5 h-3.5" />
+                  </>
+                )}
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -233,6 +251,12 @@ export default function FullInterviewPage() {
               Interview In Progress
             </span>
           )}
+          <button
+            onClick={() => window.location.href = "/dashboard"}
+            className="flex items-center gap-1.5 text-xs text-slate-700 font-semibold border border-slate-200 hover:bg-slate-50 px-4 py-2 rounded-xl transition shadow-sm"
+          >
+            <LogOut className="w-3.5 h-3.5 text-slate-500" /> Exit
+          </button>
           <button
             onClick={handleResetAll}
             className="flex items-center gap-1.5 text-xs text-rose-600 bg-rose-50 hover:bg-rose-100 px-4 py-2 rounded-xl transition"

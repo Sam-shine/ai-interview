@@ -28,7 +28,8 @@ import {
   Maximize2,
   Minimize2,
   RefreshCw,
-  Download
+  Download,
+  LogOut
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -107,6 +108,25 @@ export default function OARoundPage() {
 
   // Report toggle sections
   const [activeReportSection, setActiveReportSection] = useState<string>("overview");
+
+  const handleExit = () => {
+    const activeViews = ["mcq", "mcq_review", "coding_list", "coding_editor", "aptitude", "aptitude_review"];
+    if (activeViews.includes(view)) {
+      const confirmExit = window.confirm(
+        "Are you sure you want to exit the assessment? Your current progress in this round will be saved, but the session timer will continue to run."
+      );
+      if (!confirmExit) return;
+    }
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      const fId = params.get("fullSessionId");
+      if (fId) {
+        window.location.href = `/dashboard/interview?sessionId=${fId}`;
+        return;
+      }
+    }
+    window.location.href = "/dashboard";
+  };
 
   // Load session from storage if existing
   useEffect(() => {
@@ -647,11 +667,19 @@ export default function OARoundPage() {
       {/* ─── SETUP / CONFIGURATION SCREEN ─────────────────────────────────── */}
       {view === "setup" && (
         <div className="space-y-6 animate-in fade-in duration-200">
-          <div className="mb-4">
-            <h1 className="text-2xl font-semibold text-[#111111] tracking-tight">OA Round</h1>
-            <p className="text-[#9CA3AF] mt-1 text-[13px]">
-              Configure your profile context using your Resume, a Job Description, or a Target Role, then generate the assessment.
-            </p>
+          <div className="mb-4 flex items-center justify-between">
+            <div>
+              <h1 className="text-2xl font-semibold text-[#111111] tracking-tight">OA Round</h1>
+              <p className="text-[#9CA3AF] mt-1 text-[13px]">
+                Configure your profile context using your Resume, a Job Description, or a Target Role, then generate the assessment.
+              </p>
+            </div>
+            <button
+              onClick={handleExit}
+              className="flex items-center gap-1.5 text-xs text-slate-700 font-semibold border border-slate-200 bg-white hover:bg-slate-50 px-4 py-2 rounded-xl transition shadow-sm"
+            >
+              <LogOut className="w-3.5 h-3.5 text-slate-500" /> Exit Assessment
+            </button>
           </div>
 
           {!contextReady ? (
@@ -713,8 +741,16 @@ export default function OARoundPage() {
                 <h2 className="text-[16px] font-semibold text-[#111111]">OA Round Progress</h2>
                 <p className="text-xs text-[#9CA3AF] mt-0.5">Complete all sections to finish your assessment.</p>
               </div>
-              <div className="flex items-center gap-1.5 text-xs text-[#6B7280]">
-                <Clock className="w-3.5 h-3.5" /> Total Time: <span className="font-semibold text-[#111111]">80 mins</span>
+              <div className="flex items-center gap-4">
+                <div className="flex items-center gap-1.5 text-xs text-[#6B7280]">
+                  <Clock className="w-3.5 h-3.5" /> Total Time: <span className="font-semibold text-[#111111]">80 mins</span>
+                </div>
+                <button
+                  onClick={handleExit}
+                  className="flex items-center gap-1.5 text-xs text-rose-600 bg-rose-50 hover:bg-rose-100 px-3 py-1.5 rounded-lg transition font-semibold"
+                >
+                  <LogOut className="w-3.5 h-3.5" /> Exit Assessment
+                </button>
               </div>
             </div>
 
@@ -815,9 +851,17 @@ export default function OARoundPage() {
                   <h2 className="text-[16px] font-semibold text-[#111111]">MCQ Section</h2>
                   <p className="text-xs text-[#9CA3AF]">Multiple choice questions • 15 questions</p>
                 </div>
-                <div className="flex items-center gap-2 text-sm font-semibold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-lg">
-                  <Clock className="w-4 h-4" />
-                  <span>Time Left: {formatTime(mcqTimeLeft)}</span>
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={handleExit}
+                    className="flex items-center gap-1.5 text-xs text-rose-600 bg-rose-50 hover:bg-rose-100 px-3.5 py-1.5 rounded-lg transition font-semibold"
+                  >
+                    <LogOut className="w-3.5 h-3.5" /> Exit
+                  </button>
+                  <div className="flex items-center gap-2 text-sm font-semibold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-lg">
+                    <Clock className="w-4 h-4" />
+                    <span>Time Left: {formatTime(mcqTimeLeft)}</span>
+                  </div>
                 </div>
               </div>
 
@@ -1022,9 +1066,17 @@ export default function OARoundPage() {
               <h2 className="text-[16px] font-semibold text-[#111111]">Coding Section</h2>
               <p className="text-xs text-[#9CA3AF]">Programming challenges • 5 problems</p>
             </div>
-            <div className="flex items-center gap-2 text-sm font-semibold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-lg">
-              <Clock className="w-4 h-4" />
-              <span>Time Left: {formatTime(codingTimeLeft)}</span>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={handleExit}
+                className="flex items-center gap-1.5 text-xs text-rose-600 bg-rose-50 hover:bg-rose-100 px-3.5 py-1.5 rounded-lg transition font-semibold"
+              >
+                <LogOut className="w-3.5 h-3.5" /> Exit
+              </button>
+              <div className="flex items-center gap-2 text-sm font-semibold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-lg">
+                <Clock className="w-4 h-4" />
+                <span>Time Left: {formatTime(codingTimeLeft)}</span>
+              </div>
             </div>
           </div>
 
@@ -1345,8 +1397,16 @@ export default function OARoundPage() {
               </div>
 
               {/* Time display */}
-              <div className="flex items-center gap-1.5 font-semibold text-[#6B7280]">
-                <Clock className="w-3.5 h-3.5" /> {formatTime(codingTimeLeft)}
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={handleExit}
+                  className="flex items-center gap-1.5 text-xs text-rose-600 bg-rose-50 hover:bg-rose-100 px-2.5 py-1 rounded transition font-semibold"
+                >
+                  <LogOut className="w-3 h-3" /> Exit
+                </button>
+                <div className="flex items-center gap-1.5 font-semibold text-[#6B7280]">
+                  <Clock className="w-3.5 h-3.5" /> {formatTime(codingTimeLeft)}
+                </div>
               </div>
             </div>
 
@@ -1430,9 +1490,17 @@ export default function OARoundPage() {
                   <h2 className="text-[16px] font-semibold text-[#111111]">Aptitude Section</h2>
                   <p className="text-xs text-[#9CA3AF]">Aptitude & reasoning • 10 questions</p>
                 </div>
-                <div className="flex items-center gap-2 text-sm font-semibold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-lg">
-                  <Clock className="w-4 h-4" />
-                  <span>Time Left: {formatTime(aptitudeTimeLeft)}</span>
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={handleExit}
+                    className="flex items-center gap-1.5 text-xs text-rose-600 bg-rose-50 hover:bg-rose-100 px-3.5 py-1.5 rounded-lg transition font-semibold"
+                  >
+                    <LogOut className="w-3.5 h-3.5" /> Exit
+                  </button>
+                  <div className="flex items-center gap-2 text-sm font-semibold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-lg">
+                    <Clock className="w-4 h-4" />
+                    <span>Time Left: {formatTime(aptitudeTimeLeft)}</span>
+                  </div>
                 </div>
               </div>
 
@@ -1639,12 +1707,20 @@ export default function OARoundPage() {
                 Assessment completed on {new Date(session.updatedAt).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })}
               </p>
             </div>
-            <button
-              onClick={() => setView("report")}
-              className="px-4 py-2 border border-[#ECECEC] hover:bg-gray-50 text-[13px] font-medium rounded-lg text-[#6B7280] hover:text-[#111111] transition flex items-center gap-1.5 cursor-pointer"
-            >
-              <Download className="w-4 h-4" /> Download Report
-            </button>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={handleExit}
+                className="px-4 py-2 border border-[#ECECEC] bg-white hover:bg-gray-50 text-[13px] font-medium rounded-lg text-slate-700 transition flex items-center gap-1.5 cursor-pointer shadow-sm"
+              >
+                <LogOut className="w-4 h-4 text-slate-500" /> Exit
+              </button>
+              <button
+                onClick={() => setView("report")}
+                className="px-4 py-2 border border-[#ECECEC] hover:bg-gray-50 text-[13px] font-medium rounded-lg text-[#6B7280] hover:text-[#111111] transition flex items-center gap-1.5 cursor-pointer"
+              >
+                <Download className="w-4 h-4" /> Download Report
+              </button>
+            </div>
           </div>
 
           <div className="bg-white rounded-lg border border-[#ECECEC] p-8 flex flex-col md:flex-row items-center md:items-stretch gap-8">
@@ -1809,12 +1885,18 @@ export default function OARoundPage() {
               Recommendations
             </button>
             
-            <div className="border-t border-[#ECECEC] pt-4 mt-4 text-center">
+            <div className="border-t border-[#ECECEC] pt-4 mt-4 text-center space-y-2">
               <button
                 onClick={() => setView("results")}
                 className="w-full py-2 border border-[#ECECEC] hover:bg-gray-50 rounded-lg text-[11px] font-semibold text-[#6B7280] transition cursor-pointer"
               >
                 Back to Results Summary
+              </button>
+              <button
+                onClick={handleExit}
+                className="w-full py-2 border border-[#ECECEC] bg-white hover:bg-rose-50 hover:border-rose-200 rounded-lg text-[11px] font-semibold text-rose-600 transition cursor-pointer flex items-center justify-center gap-1"
+              >
+                <LogOut className="w-3 h-3 text-rose-500" /> Exit Assessment
               </button>
             </div>
           </div>
