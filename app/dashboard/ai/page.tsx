@@ -1,11 +1,12 @@
 "use client";
 
 import React, { useState, useEffect, useRef } from "react";
+import Image from "next/image";
 import {
   Camera, CameraOff, Mic, MicOff, Monitor, CheckCircle2,
   AlertTriangle, ArrowRight, ChevronDown, ChevronRight,
   Download, RefreshCw, Clock, Volume2, Shield, Video,
-  AlertOctagon, Activity, Play, Check, X, LogOut, FileText
+  AlertOctagon, Activity, LogOut, FileText, Loader2, Check, X
 } from "lucide-react";
 import { toast } from "sonner";
 import { InterviewConfiguration } from "@/src/components/Dashboard/InterviewConfiguration";
@@ -13,7 +14,7 @@ import { useAuth } from "@/src/components/providers/AuthProvider";
 import type { InterviewContext, AIInterviewSession, AIQuestion, AIInterviewReport } from "@/src/types";
 
 type ViewType = "config" | "setup" | "permissions" | "lobby" | "in_progress" | "completed" | "report";
-type AvatarState = "idle" | "speaking" | "listening" | "thinking";
+type InterviewerState = "idle" | "speaking" | "listening" | "thinking";
 
 export default function AIInterviewPage() {
   const { user: authUser } = useAuth();
@@ -33,7 +34,6 @@ export default function AIInterviewPage() {
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
   const [recorder, setRecorder] = useState<MediaRecorder | null>(null);
-  const [recordedChunks, setRecordedChunks] = useState<Blob[]>([]);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
 
   // Permission Checklists
@@ -46,9 +46,10 @@ export default function AIInterviewPage() {
   const [countdown, setCountdown] = useState(5);
   const [isMuted, setIsMuted] = useState(false);
   const [isCamOff, setIsCamOff] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
-  // Speech & Avatar States
-  const [avatarState, setAvatarState] = useState<AvatarState>("idle");
+  // Speech & Interviewer States
+  const [interviewerState, setInterviewerState] = useState<InterviewerState>("idle");
   const [liveTranscript, setLiveTranscript] = useState("");
   const [isListening, setIsListening] = useState(false);
 
@@ -59,14 +60,27 @@ export default function AIInterviewPage() {
   const [reportTab, setReportTab] = useState<"overview" | "questions" | "skills" | "transcript" | "proctor">("overview");
   const [expandedQuestion, setExpandedQuestion] = useState<string | null>(null);
 
-  // Refs for Video Elements, Web Speech API & Deepgram
+  // Refs for Video Elements & Deepgram STT/TTS
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const lobbyVideoRef = useRef<HTMLVideoElement>(null);
-  const speechRecognitionRef = useRef<any>(null);
+  const liveVideoRef = useRef<HTMLVideoElement>(null);
   const deepgramSocketRef = useRef<WebSocket | null>(null);
   const deepgramRecorderRef = useRef<MediaRecorder | null>(null);
   const finalizedTranscriptRef = useRef<string>("");
+  const liveTranscriptRef = useRef<string>("");
+  const shouldListenRef = useRef(false);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const usingDeepgramRef = useRef(false);
+  const isMutedRef = useRef(false);
+  const lastTabViolationRef = useRef(0);
+  const interviewStartedRef = useRef(false);
+  const startingSessionRef = useRef(false);
+  const ttsRequestIdRef = useRef(0);
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleAnswerSubmitRef = useRef<((endEarly?: boolean) => Promise<void>) | null>(null);
+  const interviewerStateRef = useRef<InterviewerState>("idle");
+  const isSubmittingRef = useRef(false);
   const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const screenGraceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const screenGraceCountdownRef = useRef<number>(30);
@@ -78,6 +92,42 @@ export default function AIInterviewPage() {
       setUser({ $id: authUser.$id, name: authUser.name, email: authUser.email });
     }
   }, [authUser]);
+
+  // Keep mic stream ref in sync for Deepgram callbacks
+  useEffect(() => {
+    micStreamRef.current = micStream;
+  }, [micStream]);
+
+  useEffect(() => {
+    isMutedRef.current = isMuted;
+  }, [isMuted]);
+
+  useEffect(() => {
+    interviewerStateRef.current = interviewerState;
+  }, [interviewerState]);
+
+  useEffect(() => {
+    isSubmittingRef.current = isSubmitting;
+  }, [isSubmitting]);
+
+  useEffect(() => {
+    return () => {
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    };
+  }, []);
+
+  // Bind camera preview streams
+  useEffect(() => {
+    if (localVideoRef.current && cameraStream) {
+      localVideoRef.current.srcObject = cameraStream;
+    }
+    if (lobbyVideoRef.current && cameraStream) {
+      lobbyVideoRef.current.srcObject = cameraStream;
+    }
+    if (liveVideoRef.current && cameraStream && !isCamOff) {
+      liveVideoRef.current.srcObject = cameraStream;
+    }
+  }, [cameraStream, view, isCamOff]);
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -143,8 +193,12 @@ export default function AIInterviewPage() {
     setCameraStream(null);
     setMicStream(null);
     setScreenStream(null);
+    micStreamRef.current = null;
 
-    // Stop Deepgram & TTS
+    // Stop Deepgram STT + TTS
+    shouldListenRef.current = false;
+    usingDeepgramRef.current = false;
+
     if (deepgramSocketRef.current) {
       try {
         deepgramSocketRef.current.onclose = null;
@@ -154,7 +208,9 @@ export default function AIInterviewPage() {
     }
     if (deepgramRecorderRef.current) {
       try {
-        deepgramRecorderRef.current.stop();
+        if (deepgramRecorderRef.current.state !== "inactive") {
+          deepgramRecorderRef.current.stop();
+        }
       } catch (e) { }
       deepgramRecorderRef.current = null;
     }
@@ -175,11 +231,6 @@ export default function AIInterviewPage() {
 
     try {
       if (recorder) recorder.stop();
-    } catch (e) { }
-    try {
-      if (speechRecognitionRef.current) {
-        speechRecognitionRef.current.stop();
-      }
     } catch (e) { }
 
     try {
@@ -225,11 +276,11 @@ export default function AIInterviewPage() {
           setSessionId(activeSession.id);
           if (activeSession.status === "completed") {
             setView("completed");
-          } else if (activeSession.status === "in_progress") {
-            // Restore question
+          } else if (activeSession.status === "in_progress" || activeSession.status === "not_started") {
+            // Restore question — re-run permissions so media tracks are fresh
             const lastQuestion = activeSession.questions[activeSession.questions.length - 1];
             setCurrentQuestion(lastQuestion);
-            setView("permissions"); // Start with permissions checks again to ensure tracks
+            setView("permissions");
           }
         }
       }
@@ -249,10 +300,7 @@ export default function AIInterviewPage() {
 
       setCameraStream(new MediaStream([stream.getVideoTracks()[0]]));
       setMicStream(new MediaStream([stream.getAudioTracks()[0]]));
-
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = new MediaStream([stream.getVideoTracks()[0]]);
-      }
+      micStreamRef.current = new MediaStream([stream.getAudioTracks()[0]]);
 
       setPerms(prev => ({ ...prev, camera: true, mic: true }));
       toast.success("Camera and Microphone connected.");
@@ -296,6 +344,8 @@ export default function AIInterviewPage() {
   const startCountdown = () => {
     setView("lobby");
     setCountdown(5);
+    interviewStartedRef.current = false;
+    startingSessionRef.current = false;
 
     // Bind webcam preview to lobby preview
     setTimeout(() => {
@@ -304,15 +354,18 @@ export default function AIInterviewPage() {
       }
     }, 100);
 
+    // Use a local counter — React Strict Mode can double-invoke setState updaters
+    let remaining = 5;
     const interval = setInterval(() => {
-      setCountdown(prev => {
-        if (prev <= 1) {
-          clearInterval(interval);
+      remaining -= 1;
+      setCountdown(Math.max(remaining, 0));
+      if (remaining <= 0) {
+        clearInterval(interval);
+        if (!interviewStartedRef.current) {
+          interviewStartedRef.current = true;
           enterFullscreenAndStart();
-          return 0;
         }
-        return prev - 1;
-      });
+      }
     }, 1000);
   };
 
@@ -327,13 +380,11 @@ export default function AIInterviewPage() {
       console.warn("Fullscreen request rejected:", err);
     }
 
-    // Initialize speech synthesis and recognition
-    initSpeechRecognition();
-
     // Start session recording
     startRecording();
 
-    // Start timer
+    // Start timer (clear any previous)
+    if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
     setInterviewTime(0);
     timerIntervalRef.current = setInterval(() => {
       setInterviewTime(prev => prev + 1);
@@ -342,7 +393,6 @@ export default function AIInterviewPage() {
     // Initialize or start the actual interview flow
     if (sessionId) {
       setView("in_progress");
-      // Load current question
       if (session) {
         const lastQ = session.questions[session.questions.length - 1];
         setCurrentQuestion(lastQ);
@@ -355,8 +405,10 @@ export default function AIInterviewPage() {
 
   const initializeSessionAPI = async () => {
     if (!context || !user) return;
+    if (startingSessionRef.current) return;
+    startingSessionRef.current = true;
     try {
-      setAvatarState("thinking");
+      setInterviewerState("thinking");
       const res = await fetch("/api/ai-interview/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -380,6 +432,7 @@ export default function AIInterviewPage() {
       // Trigger voice
       setTimeout(() => triggerAIVoice(firstQ.questionText), 1000);
     } catch (err) {
+      startingSessionRef.current = false;
       toast.error("Failed to start AI interview.");
       setView("setup");
     }
@@ -438,60 +491,163 @@ export default function AIInterviewPage() {
     }
   };
 
-  // Start Deepgram WebSocket Recognition
+  // Silence detection — auto-submit after ~5.5s pause (same as audio interview)
+  const clearSilenceTimer = () => {
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+  };
+
+  const resetSilenceTimer = () => {
+    clearSilenceTimer();
+    const state = interviewerStateRef.current;
+    if (
+      state === "speaking" ||
+      state === "thinking" ||
+      isMutedRef.current ||
+      isSubmittingRef.current ||
+      !shouldListenRef.current
+    ) {
+      return;
+    }
+    silenceTimerRef.current = setTimeout(() => {
+      const transcript = liveTranscriptRef.current.trim();
+      if (transcript.length > 0 && handleAnswerSubmitRef.current) {
+        console.log("Auto-submitting answer due to silence:", transcript);
+        handleAnswerSubmitRef.current(false);
+      }
+    }, 5500);
+  };
+
+  const updateLiveTranscript = (val: string) => {
+    liveTranscriptRef.current = val;
+    setLiveTranscript(val);
+    if (val && val.trim().length > 0) {
+      resetSilenceTimer();
+    } else {
+      clearSilenceTimer();
+    }
+  };
+
+  // Deepgram STT — same working approach as audio interview module
   const startDeepgramRecognition = async (): Promise<boolean> => {
     try {
-      const tokenRes = await fetch("/api/deepgram/token");
-      if (tokenRes.ok) {
-        const { token } = await tokenRes.json();
-        const ws = new WebSocket("wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true", ["token", token]);
-        deepgramSocketRef.current = ws;
-
-        ws.onopen = async () => {
-          try {
-            const stream = micStream || await navigator.mediaDevices.getUserMedia({ audio: true });
-            const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
-            deepgramRecorderRef.current = recorder;
-            recorder.ondataavailable = (e) => {
-              if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-                ws.send(e.data);
-              }
-            };
-            recorder.start(250);
-          } catch (err) {
-            console.error("Deepgram MediaRecorder start error:", err);
+      // Close any existing socket/recorder first
+      if (deepgramSocketRef.current) {
+        try {
+          deepgramSocketRef.current.onclose = null;
+          deepgramSocketRef.current.close();
+        } catch (e) { }
+        deepgramSocketRef.current = null;
+      }
+      if (deepgramRecorderRef.current) {
+        try {
+          if (deepgramRecorderRef.current.state !== "inactive") {
+            deepgramRecorderRef.current.stop();
           }
-        };
+        } catch (e) { }
+        deepgramRecorderRef.current = null;
+      }
 
-        ws.onmessage = (event) => {
+      const tokenRes = await fetch("/api/deepgram/token");
+      if (!tokenRes.ok) {
+        toast.error("Failed to get Deepgram token for transcription.");
+        return false;
+      }
+
+      const { token } = await tokenRes.json();
+      if (!token) {
+        toast.error("Deepgram token missing. Check DEEPGRAM_API_KEY.");
+        return false;
+      }
+
+      const ws = new WebSocket(
+        "wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&interim_results=true&punctuate=true",
+        ["token", token]
+      );
+      deepgramSocketRef.current = ws;
+
+      ws.onopen = async () => {
+        try {
+          const stream =
+            micStreamRef.current ||
+            (await navigator.mediaDevices.getUserMedia({ audio: true }));
+
+          if (!micStreamRef.current) {
+            micStreamRef.current = stream;
+            setMicStream(stream);
+          }
+
+          const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+            ? "audio/webm;codecs=opus"
+            : "audio/webm";
+
+          const recorder = new MediaRecorder(stream, { mimeType });
+          deepgramRecorderRef.current = recorder;
+          recorder.ondataavailable = (e) => {
+            if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+              ws.send(e.data);
+            }
+          };
+          recorder.start(250);
+          usingDeepgramRef.current = true;
+        } catch (err) {
+          console.error("Deepgram MediaRecorder start error:", err);
+          toast.error("Failed to start Deepgram microphone stream.");
+          usingDeepgramRef.current = false;
+        }
+      };
+
+      ws.onmessage = (event) => {
+        try {
           const data = JSON.parse(event.data);
           const transcript = data.channel?.alternatives?.[0]?.transcript;
           if (!transcript) return;
 
           if (data.is_final) {
-            finalizedTranscriptRef.current = (finalizedTranscriptRef.current + " " + transcript).trim();
-            setLiveTranscript(finalizedTranscriptRef.current);
+            finalizedTranscriptRef.current = (
+              finalizedTranscriptRef.current + " " + transcript
+            ).trim();
+            updateLiveTranscript(finalizedTranscriptRef.current);
           } else {
-            setLiveTranscript((finalizedTranscriptRef.current + " " + transcript).trim());
+            const interim = (
+              finalizedTranscriptRef.current + " " + transcript
+            ).trim();
+            updateLiveTranscript(interim);
           }
-        };
+        } catch (e) {
+          console.warn("Failed to parse Deepgram message", e);
+        }
+      };
 
-        ws.onerror = (err) => {
-          console.error("Deepgram WebSocket error:", err);
-        };
+      ws.onerror = (err) => {
+        console.error("Deepgram WebSocket error:", err);
+        usingDeepgramRef.current = false;
+      };
 
-        ws.onclose = () => {
-          console.log("Deepgram WebSocket closed");
-        };
-        return true;
-      }
+      ws.onclose = () => {
+        usingDeepgramRef.current = false;
+        if (shouldListenRef.current && !isMutedRef.current) {
+          setTimeout(() => {
+            if (shouldListenRef.current && !isMutedRef.current) {
+              startDeepgramRecognition();
+            }
+          }, 1000);
+        }
+      };
+
+      return true;
     } catch (err) {
-      console.warn("Deepgram token fetch failed, falling back to Web Speech:", err);
+      console.error("Deepgram STT failed:", err);
+      toast.error("Deepgram speech recognition failed.");
+      return false;
     }
-    return false;
   };
 
   const stopDeepgramRecognition = () => {
+    usingDeepgramRef.current = false;
+
     if (deepgramSocketRef.current) {
       try {
         deepgramSocketRef.current.onclose = null;
@@ -499,151 +655,177 @@ export default function AIInterviewPage() {
       } catch (e) { }
       deepgramSocketRef.current = null;
     }
+
     if (deepgramRecorderRef.current) {
       try {
-        deepgramRecorderRef.current.stop();
+        if (deepgramRecorderRef.current.state !== "inactive") {
+          deepgramRecorderRef.current.stop();
+        }
       } catch (e) { }
       deepgramRecorderRef.current = null;
     }
   };
 
-  // Web Speech synthesis
+  // Deepgram TTS only — same pattern as audio interview module
   const triggerAIVoice = async (text: string) => {
-    setAvatarState("speaking");
-    setIsListening(false);
+    const requestId = ++ttsRequestIdRef.current;
 
+    setInterviewerState("speaking");
+    setIsListening(false);
+    shouldListenRef.current = false;
     stopListening();
 
-    if (typeof window !== "undefined" && window.speechSynthesis) {
-      window.speechSynthesis.cancel();
-    }
     if (ttsAudioRef.current) {
-      ttsAudioRef.current.pause();
+      try {
+        ttsAudioRef.current.onended = null;
+        ttsAudioRef.current.onerror = null;
+        ttsAudioRef.current.pause();
+      } catch (e) { }
       ttsAudioRef.current = null;
     }
+
+    const beginListening = () => {
+      // Ignore stale TTS callbacks from a superseded request
+      if (requestId !== ttsRequestIdRef.current) return;
+      setInterviewerState("listening");
+      startListening();
+    };
 
     try {
       const res = await fetch("/api/deepgram/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, voice: "aura-asteria-en" })
+        body: JSON.stringify({ text, voice: "aura-asteria-en" }),
       });
-      if (res.ok) {
-        const blob = await res.blob();
-        const audioUrl = URL.createObjectURL(blob);
-        const audio = new Audio(audioUrl);
-        ttsAudioRef.current = audio;
 
-        audio.onended = () => {
-          setAvatarState("listening");
-          startListening();
-        };
-        audio.onerror = () => {
-          setAvatarState("listening");
-          startListening();
-        };
+      if (requestId !== ttsRequestIdRef.current) return;
 
-        await audio.play();
-        return;
+      if (!res.ok) {
+        throw new Error(`Deepgram TTS failed (${res.status})`);
       }
+
+      const blob = await res.blob();
+      if (requestId !== ttsRequestIdRef.current) return;
+
+      const audioUrl = URL.createObjectURL(blob);
+      const audio = new Audio(audioUrl);
+      ttsAudioRef.current = audio;
+
+      audio.onended = () => {
+        URL.revokeObjectURL(audioUrl);
+        beginListening();
+      };
+      audio.onerror = () => {
+        URL.revokeObjectURL(audioUrl);
+        toast.error("Failed to play Deepgram voice. Starting listening anyway.");
+        beginListening();
+      };
+
+      await audio.play();
     } catch (err) {
-      console.warn("Deepgram TTS failed, falling back to Web Speech:", err);
+      if (requestId !== ttsRequestIdRef.current) return;
+      console.error("Deepgram TTS failed:", err);
+      toast.error("Deepgram text-to-speech failed. Starting listening anyway.");
+      beginListening();
     }
-
-    // Fallback to Browser Web Speech API
-    const utterance = new SpeechSynthesisUtterance(text);
-    const voices = window.speechSynthesis.getVoices();
-    const cleanVoice = voices.find(v => v.lang.startsWith("en") && (v.name.includes("Google") || v.name.includes("Natural")));
-    if (cleanVoice) utterance.voice = cleanVoice;
-
-    utterance.onend = () => {
-      setAvatarState("listening");
-      startListening();
-    };
-    utterance.onerror = () => {
-      setAvatarState("listening");
-      startListening();
-    };
-
-    window.speechSynthesis.speak(utterance);
-  };
-
-  // Web Speech recognition
-  const initSpeechRecognition = () => {
-    const SpeechRecognitionAPI = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognitionAPI) {
-      console.warn("Web Speech Recognition not supported in this browser.");
-      return;
-    }
-
-    const recObj = new SpeechRecognitionAPI();
-    recObj.continuous = true;
-    recObj.interimResults = true;
-    recObj.lang = "en-US";
-
-    recObj.onresult = (e: any) => {
-      let speech = "";
-      for (let i = e.resultIndex; i < e.results.length; ++i) {
-        speech += e.results[i][0].transcript;
-      }
-      setLiveTranscript(speech);
-    };
-
-    recObj.onerror = (e: any) => {
-      console.error("Speech Recognition error:", e);
-    };
-
-    recObj.onend = () => {
-      if (isListening) {
-        try { recObj.start(); } catch (err) { }
-      }
-    };
-
-    speechRecognitionRef.current = recObj;
   };
 
   const startListening = () => {
+    clearSilenceTimer();
+    shouldListenRef.current = true;
     setIsListening(true);
     finalizedTranscriptRef.current = "";
-    setLiveTranscript("");
+    updateLiveTranscript("");
 
-    // First try Deepgram
-    startDeepgramRecognition().then(success => {
-      if (success) return;
-
-      // Fallback to Web Speech API
-      if (speechRecognitionRef.current) {
-        try {
-          speechRecognitionRef.current.start();
-        } catch (err) {
-          console.error(err);
-        }
+    startDeepgramRecognition().then((success) => {
+      if (!success && shouldListenRef.current) {
+        toast.error(
+          "Could not start Deepgram live transcription. Check DEEPGRAM_API_KEY and mic permissions."
+        );
+        setIsListening(false);
+        shouldListenRef.current = false;
       }
     });
   };
 
   const stopListening = () => {
+    clearSilenceTimer();
+    shouldListenRef.current = false;
     setIsListening(false);
-
     stopDeepgramRecognition();
+  };
 
-    if (speechRecognitionRef.current) {
-      try {
-        speechRecognitionRef.current.stop();
-      } catch (err) { }
+  const cleanupInterviewMedia = async () => {
+    clearSilenceTimer();
+    if (recorder) {
+      try { recorder.stop(); } catch (e) { }
     }
+    stopListening();
+    if (ttsAudioRef.current) {
+      try {
+        ttsAudioRef.current.pause();
+        ttsAudioRef.current = null;
+      } catch (e) { }
+    }
+    stopStreams();
+    if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
+    if (screenGraceTimeoutRef.current) clearInterval(screenGraceTimeoutRef.current);
+    if (document.fullscreenElement) {
+      try { await document.exitFullscreen(); } catch (e) { }
+    }
+    localStorage.removeItem("active_ai_interview_id");
+  };
+
+  const showFinalReport = async (completedSession: AIInterviewSession) => {
+    await cleanupInterviewMedia();
+    setSession(completedSession);
+    setCurrentQuestion(null);
+    setInterviewerState("idle");
+    toast.success("Interview completed! Your report is ready.");
+
+    // Link to full interview if needed, otherwise show report
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      const fId = params.get("fullSessionId");
+      if (fId && completedSession.id) {
+        toast.info("Saving results to Full End-to-End Interview...");
+        try {
+          await fetch("/api/interview/link-round", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              fullSessionId: fId,
+              roundType: "ai",
+              roundSessionId: completedSession.id
+            })
+          });
+        } catch (e) { }
+        localStorage.removeItem("interview_context_ai");
+        setTimeout(() => {
+          window.location.href = `/dashboard/interview?sessionId=${fId}`;
+        }, 1500);
+        return;
+      }
+    }
+
+    setView("completed");
   };
 
   // Submit Answer & Dynamic Question generation
-  const handleAnswerSubmit = async () => {
-    if (!sessionId || !currentQuestion) return;
+  const handleAnswerSubmit = async (endEarly = false) => {
+    if (!sessionId || !currentQuestion || isSubmittingRef.current) return;
 
+    clearSilenceTimer();
     stopListening();
-    setAvatarState("thinking");
+    setInterviewerState("thinking");
+    setIsSubmitting(true);
+    isSubmittingRef.current = true;
 
-    const finalAnswer = liveTranscript.trim() || "(No verbal answer provided)";
+    const finalAnswer =
+      (liveTranscriptRef.current || liveTranscript).trim() ||
+      (endEarly ? "(Interview ended early)" : "(No verbal answer provided)");
     finalizedTranscriptRef.current = "";
-    setLiveTranscript("");
+    updateLiveTranscript("");
 
     try {
       const res = await fetch("/api/ai-interview/submit-answer", {
@@ -653,30 +835,37 @@ export default function AIInterviewPage() {
           sessionId,
           questionId: currentQuestion.id,
           answerText: finalAnswer,
-          violations
+          violations,
+          endInterview: endEarly
         })
       });
 
       if (!res.ok) throw new Error("Failed to submit response.");
       const data = await res.json();
-
-      setSession(data.session);
-      setViolations([]); // clear local sync cache
-
       const updatedSession = data.session as AIInterviewSession;
+
+      setSession(updatedSession);
+      setViolations([]);
+
       if (updatedSession.status === "completed") {
-        handleEndInterview(false);
+        await showFinalReport(updatedSession);
       } else {
         const nextQ = updatedSession.questions[updatedSession.questions.length - 1];
         setCurrentQuestion(nextQ);
-        setTimeout(() => triggerAIVoice(nextQ.questionText), 1000);
+        setInterviewerState("idle");
+        setTimeout(() => triggerAIVoice(nextQ.questionText), 800);
       }
     } catch (err) {
-      toast.error("Failed to submit answer. Retrying speech...");
-      setAvatarState("listening");
+      toast.error("Failed to submit answer. Please try again.");
+      setInterviewerState("listening");
       startListening();
+    } finally {
+      setIsSubmitting(false);
+      isSubmittingRef.current = false;
     }
   };
+
+  handleAnswerSubmitRef.current = handleAnswerSubmit;
 
   // Proctoring Event Binding
   useEffect(() => {
@@ -712,6 +901,13 @@ export default function AIInterviewPage() {
   }, [view, violations, session]);
 
   const logViolation = (type: "tab_switch" | "fullscreen_exit" | "screen_share_interrupted") => {
+    // Debounce duplicate tab-switch events (visibility + blur often fire together)
+    if (type === "tab_switch") {
+      const now = Date.now();
+      if (now - lastTabViolationRef.current < 2000) return;
+      lastTabViolationRef.current = now;
+    }
+
     const newViolation = {
       type,
       timestamp: new Date().toLocaleTimeString()
@@ -790,84 +986,44 @@ export default function AIInterviewPage() {
     }
   };
 
-  // Ending the interview
+  // Ending the interview (leave early / violations) — always produce a report
   const handleEndInterview = async (blocked = false) => {
-    // Stop recording and speech
-    if (recorder) {
-      try { recorder.stop(); } catch (e) { }
-    }
-    stopListening();
-    window.speechSynthesis.cancel();
-    stopStreams();
-
-    if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
-    if (screenGraceTimeoutRef.current) clearInterval(screenGraceTimeoutRef.current);
-
-    // Exit fullscreen
-    if (document.fullscreenElement) {
-      try { await document.exitFullscreen(); } catch (e) { }
+    if (!sessionId) {
+      await cleanupInterviewMedia();
+      setView("config");
+      return;
     }
 
-    localStorage.removeItem("active_ai_interview_id");
+    try {
+      setIsSubmitting(true);
+      const res = await fetch("/api/ai-interview/submit-answer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId,
+          questionId: currentQuestion?.id || session?.questions?.[session.questions.length - 1]?.id || "q-1",
+          answerText: blocked
+            ? "(Forcefully Terminated - Violation Limit Exceeded)"
+            : ((liveTranscriptRef.current || liveTranscript).trim() || "(Interview ended early)"),
+          violations,
+          endInterview: true
+        })
+      });
 
-    if (blocked) {
-      // Force status update on API
-      try {
-        await fetch("/api/ai-interview/submit-answer", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            sessionId,
-            questionId: currentQuestion?.id || "q-1",
-            answerText: "(Forcefully Terminated - Violation Limit Exceeded)",
-            violations
-          })
-        });
-      } catch (err) { }
-
-      toast.error("Interview completed with violations.");
-    } else {
-      toast.success("Interview completed successfully!");
-    }
-
-    // Refresh final report status
-    if (sessionId) {
-      try {
-        const res = await fetch(`/api/ai-interview/session?sessionId=${sessionId}`);
-        if (res.ok) {
-          const data = await res.json();
-          setSession(data.session);
-        }
-      } catch (err) { }
-    }
-
-    // If full interview, link and redirect
-    if (typeof window !== "undefined") {
-      const params = new URLSearchParams(window.location.search);
-      const fId = params.get("fullSessionId");
-      if (fId && sessionId) {
-        toast.info("Saving results to Full End-to-End Interview...");
-        try {
-          await fetch("/api/interview/link-round", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              fullSessionId: fId,
-              roundType: "ai",
-              roundSessionId: sessionId
-            })
-          });
-        } catch (e) { }
-        localStorage.removeItem("active_ai_interview_id");
-        localStorage.removeItem("interview_context_ai");
-        localStorage.removeItem("interview_context_oa");
-        setTimeout(() => {
-          window.location.href = `/dashboard/interview?sessionId=${fId}`;
-        }, 1500);
+      if (res.ok) {
+        const data = await res.json();
+        if (blocked) toast.error("Interview completed with violations.");
+        await showFinalReport(data.session as AIInterviewSession);
         return;
       }
+    } catch (err) {
+      console.error("Failed to finalize AI interview:", err);
+    } finally {
+      setIsSubmitting(false);
     }
 
+    // Fallback: still leave the live room even if finalize fails
+    await cleanupInterviewMedia();
     setView("completed");
   };
 
@@ -897,108 +1053,68 @@ export default function AIInterviewPage() {
     return `${mins.toString().padStart(2, "0")}:${rs.toString().padStart(2, "0")}`;
   };
 
-  // SVG Animated Avatar component
-  const SVGAvatar = ({ state }: { state: AvatarState }) => {
-    const isSpeaking = state === "speaking";
-    const isListening = state === "listening";
-    const isThinking = state === "thinking";
+  // Human interviewer panel (static photo + status)
+  const HumanInterviewer = ({ state }: { state: InterviewerState }) => {
+    const statusLabel =
+      state === "speaking"
+        ? "Speaking"
+        : state === "listening"
+          ? "Listening"
+          : state === "thinking"
+            ? "Thinking"
+            : "Ready";
+
+    const statusColor =
+      state === "speaking"
+        ? "bg-blue-50 text-blue-700 border-blue-100"
+        : state === "listening"
+          ? "bg-emerald-50 text-emerald-700 border-emerald-100"
+          : state === "thinking"
+            ? "bg-amber-50 text-amber-700 border-amber-100"
+            : "bg-slate-50 text-slate-600 border-slate-200";
 
     return (
-      <div className="relative w-64 h-64 mx-auto flex items-center justify-center bg-slate-900/40 rounded-full border border-slate-700/50 shadow-xl overflow-hidden glassmorphism">
-        <svg viewBox="0 0 100 100" className="w-48 h-48 drop-shadow-2xl">
-          {/* Collar & Neck */}
-          <path d="M40 75 L35 88 L65 88 L60 75 Z" fill="#1E293B" />
-          <path d="M43 72 L43 78 L57 78 L57 72 Z" fill="#FDA4AF" />
+      <div className="relative h-full min-h-[280px] w-full overflow-hidden rounded-lg border border-[#ECECEC] bg-[#F9FAFB]">
+        <Image
+          src="/ai-avatar.png"
+          alt="AI Interviewer"
+          fill
+          className="object-cover object-top"
+          priority
+          sizes="(max-width: 768px) 100vw, 50vw"
+        />
+        <div className="absolute inset-0 bg-gradient-to-t from-black/55 via-black/10 to-transparent" />
 
-          {/* Suit/Jacket */}
-          <path d="M22 88 L35 77 L44 88 Z" fill="#0F172A" />
-          <path d="M78 88 L65 77 L56 88 Z" fill="#0F172A" />
-          <path d="M35 77 L50 88 L65 77 Z" fill="#334155" />
-          <path d="M44 88 L50 82 L56 88 Z" fill="#FFFFFF" />
-
-          {/* Ears */}
-          <circle cx="28" cy="50" r="5" fill="#FCA5A5" />
-          <circle cx="72" cy="50" r="5" fill="#FCA5A5" />
-
-          {/* Face */}
-          <rect x="30" y="32" width="40" height="42" rx="20" fill="#FEE2E2" />
-
-          {/* Hair */}
-          <path d="M30 38 Q50 18 70 38 Q50 25 30 38" fill="#1E1B4B" />
-          <path d="M30 38 C28 32 35 28 40 28 C45 28 45 22 55 22 C65 22 68 28 70 38 Z" fill="#0F172A" />
-
-          {/* Eyebrows */}
-          <path
-            d="M36 41 Q41 39 45 42"
-            stroke="#1E1B4B"
-            strokeWidth="1.5"
-            fill="none"
-            className={isThinking ? "animate-pulse" : ""}
-          />
-          <path
-            d="M64 41 Q59 39 55 42"
-            stroke="#1E1B4B"
-            strokeWidth="1.5"
-            fill="none"
-            className={isThinking ? "animate-pulse" : ""}
-          />
-
-          {/* Eyes & Blinking */}
-          <g className="animate-[blink_4s_infinite_alternate]">
-            {/* Left Pupil */}
-            <circle
-              cx={isThinking ? 41 : 42}
-              cy="47"
-              r="2.5"
-              fill="#0F172A"
-              className={isThinking ? "transition-all duration-700" : ""}
-            />
-            {/* Right Pupil */}
-            <circle
-              cx={isThinking ? 59 : 58}
-              cy="47"
-              r="2.5"
-              fill="#0F172A"
-              className={isThinking ? "transition-all duration-700" : ""}
-            />
-          </g>
-
-          {/* Mouth */}
-          {isSpeaking ? (
-            // Speaking mouth
-            <path
-              d="M44 62 Q50 67 56 62 Q50 55 44 62"
-              fill="#E11D48"
-              className="origin-center animate-[talk_0.2s_infinite]"
-            />
-          ) : isListening ? (
-            // Listening (open slightly)
-            <ellipse cx="50" cy="62" rx="3" ry="1.5" fill="#9F1239" className="animate-pulse" />
-          ) : isThinking ? (
-            // Thinking (puckered/straight line)
-            <line x1="46" y1="62" x2="54" y2="62" stroke="#9F1239" strokeWidth="1.5" strokeLinecap="round" />
-          ) : (
-            // Idle smile
-            <path d="M44 60 Q50 64 56 60" stroke="#9F1239" strokeWidth="1.5" fill="none" strokeLinecap="round" />
-          )}
-
-          {/* Glasses */}
-          <circle cx="42" cy="47" r="6" stroke="#475569" strokeWidth="1" fill="none" />
-          <circle cx="58" cy="47" r="6" stroke="#475569" strokeWidth="1" fill="none" />
-          <line x1="48" y1="47" x2="52" y2="47" stroke="#475569" strokeWidth="1" />
-        </svg>
-
-        {/* Thinking Overlay Dots */}
-        {isThinking && (
-          <div className="absolute bottom-6 flex items-center justify-center gap-1 bg-slate-800/80 px-3 py-1 rounded-full border border-slate-700 text-xs text-rose-400 font-semibold tracking-wider">
-            <span>Thinking</span>
-            <span className="flex gap-0.5 mt-0.5">
-              <span className="w-1 h-1 bg-rose-400 rounded-full animate-bounce delay-100"></span>
-              <span className="w-1 h-1 bg-rose-400 rounded-full animate-bounce delay-200"></span>
-              <span className="w-1 h-1 bg-rose-400 rounded-full animate-bounce delay-300"></span>
-            </span>
+        <div className="absolute bottom-0 left-0 right-0 p-4 flex items-end justify-between gap-3">
+          <div>
+            <p className="text-white text-sm font-semibold tracking-tight">AI Interviewer</p>
+            <p className="text-white/70 text-[11px] mt-0.5">Technical panel</p>
           </div>
-        )}
+          <span className={`text-[10px] font-semibold uppercase tracking-wider px-2.5 py-1 rounded-md border ${statusColor}`}>
+            {statusLabel}
+          </span>
+        </div>
+
+        {/* Speaking / listening bars */}
+        <div className="absolute bottom-16 left-4 flex items-end gap-1 h-6">
+          {state === "speaking"
+            ? [...Array(8)].map((_, i) => (
+              <span
+                key={i}
+                style={{ animationDelay: `${i * 0.07}s` }}
+                className="w-1 rounded-full bg-blue-400 animate-[ai-talk_0.35s_ease-in-out_infinite]"
+              />
+            ))
+            : state === "listening"
+              ? [...Array(8)].map((_, i) => (
+                <span
+                  key={i}
+                  style={{ animationDelay: `${i * 0.1}s`, height: "0.5rem" }}
+                  className="w-1 rounded-full bg-emerald-400 animate-[ai-listen-pulse_1s_ease-in-out_infinite]"
+                />
+              ))
+              : null}
+        </div>
       </div>
     );
   };
@@ -1245,8 +1361,8 @@ export default function AIInterviewPage() {
                 <span className="text-green-600 font-bold">Supported</span>
               </div>
               <div className="flex justify-between items-center text-xs pb-2">
-                <span className="text-[#6B7280]">Browser Speech Engine</span>
-                <span className="text-green-600 font-bold">Supported</span>
+                <span className="text-[#6B7280]">Deepgram STT / TTS</span>
+                <span className="text-green-600 font-bold">Ready</span>
               </div>
             </div>
 
@@ -1340,263 +1456,261 @@ export default function AIInterviewPage() {
 
       {/* VIEW: LIVE AI INTERVIEW ROOM */}
       {view === "in_progress" && currentQuestion && (
-        <div className="fixed inset-0 z-50 bg-[#0F172A] text-white flex flex-col">
+        <div className="fixed inset-0 z-50 bg-[#FAFAFA] text-[#111111] flex flex-col">
 
-          {/* TOP TELEMETRY BAR */}
-          <div className="h-16 border-b border-slate-800 px-6 flex items-center justify-between bg-slate-900/60 backdrop-blur-md">
+          {/* TOP BAR */}
+          <header className="h-14 border-b border-[#ECECEC] px-5 lg:px-6 flex items-center justify-between bg-white shrink-0">
             <div className="flex items-center gap-2.5">
-              <span className="w-2.5 h-2.5 bg-rose-600 rounded-full animate-pulse"></span>
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-300">AI Interview In Progress</span>
+              <span className="relative flex h-2.5 w-2.5">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75" />
+                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-500" />
+              </span>
+              <span className="text-[13px] font-semibold text-[#111111]">AI Interview in Progress</span>
             </div>
 
-            <div className="bg-slate-950 px-4 py-1.5 rounded-full border border-slate-800 text-xs font-semibold text-slate-400 flex items-center gap-2">
-              <Activity className="w-3.5 h-3.5 text-blue-500 animate-pulse" />
+            <div className="flex items-center gap-1.5 bg-[#F9FAFB] px-3 py-1.5 rounded-lg border border-[#ECECEC] text-xs font-medium text-[#6B7280]">
+              <Activity className="w-3.5 h-3.5 text-blue-500" />
               <span>Question {session?.questions.length || 1} / 10</span>
             </div>
 
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2.5">
               <button
                 onClick={handleExit}
-                className="flex items-center gap-1.5 text-xs text-rose-400 bg-rose-950/40 hover:bg-rose-900/60 px-3.5 py-1.5 rounded-lg border border-rose-900/40 transition font-semibold"
+                className="flex items-center gap-1.5 text-xs text-rose-600 bg-rose-50 hover:bg-rose-100 px-3 py-1.5 rounded-lg border border-rose-100 transition font-medium"
               >
-                <LogOut className="w-3.5 h-3.5" /> Exit Interview
+                <LogOut className="w-3.5 h-3.5" /> Exit
               </button>
-              <div className="flex items-center gap-2 text-slate-400 font-medium text-xs bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800">
-                <Clock className="w-4 h-4 text-rose-500" />
-                <span>{formatTimer(interviewTime)}</span>
+              <div className="flex items-center gap-1.5 text-[#6B7280] font-medium text-xs bg-[#F9FAFB] px-3 py-1.5 rounded-lg border border-[#ECECEC]">
+                <Clock className="w-3.5 h-3.5 text-red-500" />
+                <span className="font-mono text-red-600">{formatTimer(interviewTime)}</span>
               </div>
             </div>
-          </div>
+          </header>
 
-          {/* MAIN CHAT & AVATAR CANVAS */}
-          <div className="flex-1 flex flex-col md:flex-row p-6 gap-6 items-stretch overflow-hidden">
+          {/* MAIN CONTENT */}
+          <div className="flex-1 flex flex-col p-4 lg:p-5 gap-4 overflow-hidden min-h-0">
 
-            {/* Left AI Avatar Box */}
-            <div className="flex-1 flex flex-col bg-slate-900/40 rounded-2xl border border-slate-800/80 p-6 justify-center items-center relative overflow-hidden shadow-inner">
-              <SVGAvatar state={avatarState} />
+            {/* Video row: AI interviewer (left) + user live video (right) */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 shrink-0 h-[38vh] min-h-[220px] max-h-[340px]">
+              <HumanInterviewer state={interviewerState} />
 
-              {/* Dynamic waveform based on voice speaking state */}
-              <div className="mt-8 flex items-center gap-1.5 h-8">
-                {avatarState === "speaking" ? (
-                  // Active talking waveform
-                  [...Array(12)].map((_, i) => (
-                    <span
-                      key={i}
-                      style={{ animationDelay: `${i * 0.08}s` }}
-                      className="w-1 bg-gradient-to-t from-rose-500 to-rose-400 rounded-full animate-[talk_0.3s_infinite]"
-                    ></span>
-                  ))
-                ) : avatarState === "listening" ? (
-                  // Pulsing listening waveform
-                  [...Array(12)].map((_, i) => (
-                    <span
-                      key={i}
-                      className="w-1 h-2 bg-blue-500/60 rounded-full animate-pulse"
-                    ></span>
-                  ))
+              <div className="relative h-full min-h-[220px] w-full overflow-hidden rounded-lg border border-[#ECECEC] bg-[#111111]">
+                {cameraStream && !isCamOff ? (
+                  <video
+                    ref={liveVideoRef}
+                    autoPlay
+                    playsInline
+                    muted
+                    className="absolute inset-0 w-full h-full object-cover scale-x-[-1]"
+                  />
                 ) : (
-                  // Flat line
-                  [...Array(12)].map((_, i) => (
-                    <span key={i} className="w-1 h-1 bg-slate-600 rounded-full"></span>
-                  ))
+                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-slate-400 bg-[#1a1a1a]">
+                    <CameraOff className="w-8 h-8" />
+                    <span className="text-xs">Camera is off</span>
+                  </div>
+                )}
+                <div className="absolute inset-x-0 bottom-0 p-4 bg-gradient-to-t from-black/60 to-transparent">
+                  <p className="text-white text-sm font-semibold">{user?.name || "Candidate"}</p>
+                  <p className="text-white/70 text-[11px] mt-0.5">
+                    {context?.role || "Interview Candidate"}
+                  </p>
+                </div>
+                {isListening && (
+                  <div className="absolute top-3 right-3 flex items-center gap-1.5 bg-emerald-500 text-white text-[10px] font-semibold px-2 py-1 rounded-md">
+                    <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
+                    Live
+                  </div>
                 )}
               </div>
             </div>
 
-            {/* Right Question Bubble & Live Transcriber */}
-            <div className="flex-1 flex flex-col gap-6">
-
-              {/* Question bubble */}
-              <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-6 flex flex-col gap-4 relative">
-                <span className="text-[11px] font-bold uppercase tracking-wider text-rose-500">
-                  {avatarState === "speaking" ? "AI is speaking..." : avatarState === "thinking" ? "AI is preparing next topic..." : "AI Panel"}
+            {/* Question + Transcript */}
+            <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-4 min-h-0 overflow-hidden">
+              {/* Question */}
+              <div className="bg-white border border-[#ECECEC] rounded-lg p-5 flex flex-col overflow-y-auto">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-blue-600 mb-2">
+                  {interviewerState === "speaking"
+                    ? "AI is speaking..."
+                    : interviewerState === "thinking"
+                      ? "Preparing next question..."
+                      : "Current Question"}
                 </span>
-                <p className="text-base font-medium leading-relaxed text-slate-100">
+                <p className="text-[15px] font-medium leading-relaxed text-[#111111]">
                   {currentQuestion.questionText}
                 </p>
               </div>
 
-              {/* Live transcript input feedback box */}
-              <div className="flex-grow bg-slate-950 border border-slate-800 rounded-2xl p-6 flex flex-col justify-between overflow-y-auto">
-                <div className="flex flex-col gap-2">
-                  <span className="text-[11px] font-bold uppercase tracking-wider text-blue-500 flex items-center gap-1.5">
-                    {isListening && <span className="w-1.5 h-1.5 bg-blue-500 rounded-full animate-ping"></span>}
-                    {isListening ? "Listening to your answer..." : "Transcript status"}
+              {/* Live transcript */}
+              <div className="bg-white border border-[#ECECEC] rounded-lg p-5 flex flex-col min-h-0 overflow-hidden">
+                <div className="flex items-center justify-between mb-2 shrink-0">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-[#6B7280] flex items-center gap-1.5">
+                    {isListening && <span className="w-1.5 h-1.5 bg-blue-500 rounded-full animate-ping" />}
+                    {isListening ? "Live Transcription" : "Your Answer"}
                   </span>
-
-                  {liveTranscript ? (
-                    <p className="text-sm font-medium leading-relaxed text-slate-200 mt-2">
-                      {liveTranscript}
-                    </p>
-                  ) : (
-                    <p className="text-xs italic text-slate-600 mt-2">
-                      {isListening ? "Speak clearly. Your voice is transcribing here in real-time..." : "Voice recognizer waiting for AI to complete speaking..."}
-                    </p>
-                  )}
-                </div>
-
-                <div className="flex justify-end gap-2 mt-4">
                   {isListening ? (
                     <button
-                      onClick={handleAnswerSubmit}
-                      className="bg-blue-600 hover:bg-blue-500 text-white font-semibold px-6 py-3 rounded-xl transition text-xs shadow-lg"
+                      onClick={() => handleAnswerSubmit(false)}
+                      disabled={isSubmitting}
+                      className="bg-[#2563EB] hover:bg-blue-700 disabled:opacity-60 text-white font-medium px-4 py-2 rounded-lg transition text-xs flex items-center gap-1.5"
                     >
-                      Submit Answer
+                      {isSubmitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
+                      {isSubmitting ? "Submitting..." : "Submit Now"}
                     </button>
                   ) : (
                     <button
                       disabled
-                      className="bg-slate-800 text-slate-500 font-semibold px-6 py-3 rounded-xl text-xs"
+                      className="bg-[#F3F4F6] text-[#9CA3AF] font-medium px-4 py-2 rounded-lg text-xs cursor-not-allowed"
                     >
-                      Wait for AI
+                      {isSubmitting ? "Processing..." : "Auto-advances on pause"}
                     </button>
                   )}
                 </div>
+
+                <div className="flex-1 overflow-y-auto rounded-md bg-[#F9FAFB] border border-[#F3F4F6] p-3 min-h-[100px]">
+                  {liveTranscript ? (
+                    <p className="text-sm leading-relaxed text-[#111111] whitespace-pre-wrap">
+                      {liveTranscript}
+                    </p>
+                  ) : (
+                    <p className="text-xs italic text-[#9CA3AF]">
+                      {isListening
+                        ? "Speak clearly — pause for ~5–6 seconds when done and we will auto-advance."
+                        : interviewerState === "thinking"
+                          ? "Evaluating your previous answer..."
+                          : "Waiting for the interviewer to finish speaking..."}
+                    </p>
+                  )}
+                </div>
               </div>
-
             </div>
-
           </div>
 
-          {/* BOTTOM CONTROLS & CAMERA FEED */}
-          <div className="h-24 bg-slate-950 border-t border-slate-800 px-6 flex items-center justify-between">
-            {/* Floating Webcam Feed */}
-            <div className="flex items-center gap-4">
-              <div className="w-24 h-16 bg-slate-900 border border-slate-800 rounded-lg overflow-hidden relative shadow-inner">
-                {cameraStream && !isCamOff ? (
-                  <video
-                    autoPlay
-                    playsInline
-                    muted
-                    className="w-full h-full object-cover scale-x-[-1]"
-                    ref={(el) => {
-                      if (el && cameraStream) el.srcObject = cameraStream;
-                    }}
-                  />
-                ) : (
-                  <div className="absolute inset-0 flex items-center justify-center bg-slate-950 text-slate-600">
-                    <CameraOff className="w-5 h-5" />
-                  </div>
-                )}
+          {/* BOTTOM CONTROLS */}
+          <footer className="h-16 bg-white border-t border-[#ECECEC] px-5 lg:px-6 flex items-center justify-between shrink-0">
+            <div className="flex items-center gap-2 min-w-[140px]">
+              <div className="w-8 h-8 rounded-md bg-blue-50 text-blue-600 flex items-center justify-center text-xs font-semibold border border-blue-100">
+                {(user?.name || "C").charAt(0).toUpperCase()}
               </div>
-              <div>
-                <h4 className="text-xs font-bold text-slate-300">{user?.name}</h4>
-                <p className="text-[10px] text-slate-500">MERN Stack Candidate</p>
+              <div className="hidden sm:block">
+                <p className="text-xs font-semibold text-[#111111] leading-tight">{user?.name}</p>
+                <p className="text-[10px] text-[#9CA3AF]">Candidate</p>
               </div>
             </div>
 
-            {/* Stream Toggles */}
-            <div className="flex items-center gap-3">
-              {/* Mic toggle */}
+            <div className="flex items-center gap-2">
               <button
                 onClick={() => {
                   if (micStream) {
-                    micStream.getAudioTracks()[0].enabled = isMuted;
-                    setIsMuted(!isMuted);
-                    toast.success(isMuted ? "Microphone active" : "Microphone muted");
+                    const next = !isMuted;
+                    micStream.getAudioTracks().forEach(t => { t.enabled = !next; });
+                    setIsMuted(next);
+                    if (next) {
+                      shouldListenRef.current = false;
+                      stopDeepgramRecognition();
+                      setIsListening(false);
+                    } else if (interviewerState === "listening") {
+                      startListening();
+                    }
+                    toast.success(next ? "Microphone muted" : "Microphone active");
                   }
                 }}
-                className={`p-3 rounded-xl border transition ${isMuted ? "bg-rose-950/40 border-rose-800 text-[#E11D48]" : "bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800"}`}
+                className={`p-2.5 rounded-lg border transition ${isMuted ? "bg-rose-50 border-rose-200 text-rose-600" : "bg-[#F9FAFB] border-[#ECECEC] text-[#374151] hover:bg-[#F3F4F6]"}`}
+                title={isMuted ? "Unmute" : "Mute"}
               >
                 {isMuted ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
               </button>
 
-              {/* Camera toggle */}
               <button
                 onClick={() => {
                   if (cameraStream) {
-                    cameraStream.getVideoTracks()[0].enabled = isCamOff;
-                    setIsCamOff(!isCamOff);
-                    toast.success(isCamOff ? "Camera active" : "Camera disabled");
+                    const next = !isCamOff;
+                    cameraStream.getVideoTracks().forEach(t => { t.enabled = !next; });
+                    setIsCamOff(next);
+                    toast.success(next ? "Camera disabled" : "Camera active");
                   }
                 }}
-                className={`p-3 rounded-xl border transition ${isCamOff ? "bg-rose-950/40 border-rose-800 text-[#E11D48]" : "bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800"}`}
+                className={`p-2.5 rounded-lg border transition ${isCamOff ? "bg-rose-50 border-rose-200 text-rose-600" : "bg-[#F9FAFB] border-[#ECECEC] text-[#374151] hover:bg-[#F3F4F6]"}`}
+                title={isCamOff ? "Turn camera on" : "Turn camera off"}
               >
                 {isCamOff ? <CameraOff className="w-4 h-4" /> : <Camera className="w-4 h-4" />}
               </button>
 
-              {/* Screen Sharing Indicator */}
-              <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 px-3.5 py-2.5 rounded-xl text-[10px] font-semibold text-slate-300">
-                <Monitor className="w-3.5 h-3.5 text-green-500" />
-                <span>Screen Sharing Active</span>
+              <div className="flex items-center gap-1.5 bg-[#F9FAFB] border border-[#ECECEC] px-3 py-2 rounded-lg text-[10px] font-medium text-[#6B7280]">
+                <Monitor className="w-3.5 h-3.5 text-emerald-500" />
+                <span className="hidden sm:inline">Screen Sharing Active</span>
               </div>
             </div>
 
-            {/* Leave button */}
             <button
               onClick={() => {
-                if (confirm("Are you sure you want to exit? Your answers will be submitted for evaluation.")) {
+                if (confirm("Are you sure you want to leave? Your answers will be submitted for evaluation.")) {
                   handleEndInterview(false);
                 }
               }}
-              className="flex items-center gap-1.5 text-xs text-[#E11D48] bg-rose-950/40 border border-rose-850 hover:bg-rose-950/80 px-4 py-2.5 rounded-xl font-semibold transition"
+              className="flex items-center gap-1.5 text-xs text-rose-600 bg-rose-50 border border-rose-100 hover:bg-rose-100 px-3.5 py-2 rounded-lg font-medium transition"
             >
-              <LogOut className="w-4 h-4" />
+              <LogOut className="w-3.5 h-3.5" />
               Leave Interview
             </button>
-          </div>
+          </footer>
 
           {/* WARNING MODAL OVERLAYS (PROCTORING) */}
           {warningModal && (
-            <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4">
+            <div className="fixed inset-0 z-[60] bg-black/40 backdrop-blur-sm flex items-center justify-center p-4">
 
-              {/* Tab Switch warning */}
               {warningModal.type === "tab" && (
-                <div className="bg-white text-slate-950 border border-slate-200 rounded-2xl p-8 max-w-md w-full shadow-2xl text-center">
-                  <div className="w-16 h-16 bg-rose-50 text-rose-600 rounded-full flex items-center justify-center mx-auto mb-6">
-                    <AlertOctagon className="w-8 h-8" />
+                <div className="bg-white border border-[#ECECEC] rounded-lg p-8 max-w-md w-full shadow-xl text-center">
+                  <div className="w-14 h-14 bg-rose-50 text-rose-600 rounded-lg flex items-center justify-center mx-auto mb-5">
+                    <AlertOctagon className="w-7 h-7" />
                   </div>
-                  <h2 className="text-xl font-bold text-slate-900 mb-2">Tab Switch Detected</h2>
-                  <p className="text-xs text-slate-500 mb-6 leading-relaxed">
-                    Please do not switch tabs or open other applications during the Interview. This is warning <span className="font-bold text-rose-600">{warningModal.count} out of 5</span>. Reaching 5 switches will auto-terminate your session.
+                  <h2 className="text-lg font-semibold text-[#111111] mb-2">Tab Switch Detected</h2>
+                  <p className="text-sm text-[#6B7280] mb-6 leading-relaxed">
+                    Please stay on this tab during the interview. This is warning{" "}
+                    <span className="font-semibold text-rose-600">{warningModal.count} of 5</span>.
+                    Reaching 5 switches will end your session.
                   </p>
                   <button
                     onClick={() => setWarningModal(null)}
-                    className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 rounded-xl transition text-xs shadow-md"
+                    className="w-full bg-[#2563EB] hover:bg-blue-700 text-white font-medium py-2.5 rounded-lg transition text-sm"
                   >
                     OK, I understand
                   </button>
                 </div>
               )}
 
-              {/* Fullscreen Exit warning */}
               {warningModal.type === "fullscreen" && (
-                <div className="bg-white text-slate-950 border border-slate-200 rounded-2xl p-8 max-w-md w-full shadow-2xl text-center">
-                  <div className="w-16 h-16 bg-rose-50 text-rose-600 rounded-full flex items-center justify-center mx-auto mb-6">
-                    <AlertTriangle className="w-8 h-8" />
+                <div className="bg-white border border-[#ECECEC] rounded-lg p-8 max-w-md w-full shadow-xl text-center">
+                  <div className="w-14 h-14 bg-rose-50 text-rose-600 rounded-lg flex items-center justify-center mx-auto mb-5">
+                    <AlertTriangle className="w-7 h-7" />
                   </div>
-                  <h2 className="text-xl font-bold text-slate-900 mb-2">Fullscreen Exit Detected</h2>
-                  <p className="text-xs text-slate-500 mb-6 leading-relaxed">
-                    Fullscreen mode is required to maintain the proctoring lock for this mock interview.
+                  <h2 className="text-lg font-semibold text-[#111111] mb-2">Fullscreen Exit Detected</h2>
+                  <p className="text-sm text-[#6B7280] mb-6 leading-relaxed">
+                    Fullscreen mode is required to keep proctoring active for this mock interview.
                   </p>
                   <button
                     onClick={requestReFullscreen}
-                    className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 rounded-xl transition text-xs shadow-md"
+                    className="w-full bg-[#2563EB] hover:bg-blue-700 text-white font-medium py-2.5 rounded-lg transition text-sm"
                   >
                     Return to Fullscreen
                   </button>
                 </div>
               )}
 
-              {/* Screen Share Drop Warning */}
               {warningModal.type === "screenshare" && (
-                <div className="bg-white text-slate-950 border border-slate-200 rounded-2xl p-8 max-w-md w-full shadow-2xl text-center">
-                  <div className="w-16 h-16 bg-rose-50 text-rose-600 rounded-full flex items-center justify-center mx-auto mb-4 animate-bounce">
-                    <Monitor className="w-8 h-8" />
+                <div className="bg-white border border-[#ECECEC] rounded-lg p-8 max-w-md w-full shadow-xl text-center">
+                  <div className="w-14 h-14 bg-rose-50 text-rose-600 rounded-lg flex items-center justify-center mx-auto mb-4">
+                    <Monitor className="w-7 h-7" />
                   </div>
-                  <h2 className="text-xl font-bold text-slate-900 mb-2">Screen Share Interrupted</h2>
-                  <p className="text-xs text-slate-500 mb-4 leading-relaxed">
-                    Screen sharing has stopped. Please resume screen sharing immediately to continue the interview.
+                  <h2 className="text-lg font-semibold text-[#111111] mb-2">Screen Share Interrupted</h2>
+                  <p className="text-sm text-[#6B7280] mb-4 leading-relaxed">
+                    Screen sharing stopped. Resume sharing immediately to continue.
                   </p>
-
-                  {/* Countdown Timer */}
-                  <div className="text-3xl font-black text-rose-600 mb-6">
+                  <div className="text-3xl font-bold text-rose-600 mb-6 font-mono">
                     {screenGraceSeconds}s
                   </div>
-
                   <button
                     onClick={resumeScreenShare}
-                    className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 rounded-xl transition text-xs shadow-md"
+                    className="w-full bg-[#2563EB] hover:bg-blue-700 text-white font-medium py-2.5 rounded-lg transition text-sm"
                   >
                     Resume Screen Share
                   </button>
@@ -1624,7 +1738,9 @@ export default function AIInterviewPage() {
           <div className="grid grid-cols-3 gap-6 w-full mb-8 bg-slate-50 p-6 rounded-xl border border-slate-100">
             <div className="text-center">
               <span className="text-[10px] uppercase font-bold text-[#9CA3AF] block tracking-wider">Total Questions</span>
-              <span className="text-xl font-extrabold text-[#111111] mt-1.5 block">10</span>
+              <span className="text-xl font-extrabold text-[#111111] mt-1.5 block">
+                {session.report?.questionFeedback?.length || session.questions.filter(q => q.answerText).length || session.questions.length}
+              </span>
             </div>
             <div className="text-center border-x border-[#E5E7EB]">
               <span className="text-[10px] uppercase font-bold text-[#9CA3AF] block tracking-wider">Duration</span>
@@ -1641,17 +1757,29 @@ export default function AIInterviewPage() {
           </div>
 
           <button
-            onClick={() => setView("report")}
+            onClick={() => {
+              if (session.report) {
+                setView("report");
+              } else {
+                toast.error("Report is still generating. Please wait a moment.");
+              }
+            }}
             className="bg-blue-600 hover:bg-blue-700 text-white font-semibold px-8 py-3 rounded-xl transition text-xs shadow-md flex items-center gap-2"
           >
             View Detailed Report
             <ArrowRight className="w-4 h-4" />
           </button>
+
+          {!session.report && (
+            <p className="text-xs text-amber-600 mt-4">
+              Report data is missing for this session. Try ending the interview again from a new run.
+            </p>
+          )}
         </div>
       )}
 
       {/* VIEW: DETAILED REPORT PANEL */}
-      {view === "report" && session && session.report && (
+      {view === "report" && session?.report && (
         <div className="grid grid-cols-1 lg:grid-cols-4 gap-8">
 
           {/* Sidebar Navigation */}

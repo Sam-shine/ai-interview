@@ -4,7 +4,7 @@ import { aiInterviewService } from "@/src/services/ai-interview.service";
 export async function POST(req: Request) {
   try {
     const body = await req.json();
-    const { sessionId, questionId, answerText, violations } = body;
+    const { sessionId, questionId, answerText, violations, endInterview } = body;
 
     if (!sessionId || !questionId) {
       return NextResponse.json(
@@ -17,7 +17,8 @@ export async function POST(req: Request) {
       sessionId,
       questionId,
       answerText,
-      violations
+      violations,
+      Boolean(endInterview)
     );
 
     return NextResponse.json({
